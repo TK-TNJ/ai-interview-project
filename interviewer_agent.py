@@ -3,41 +3,38 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from colorama import Fore, Style
 
-# Load environment variables
 load_dotenv()
 
 class InterviewerAgent:
     def __init__(self):
-        """
-        Initializes the AI model with Auto-Discovery logic.
-        """
         api_key = os.getenv("GEMINI_API_KEY")
-        
         if not api_key:
-            print(f"{Fore.RED}DEBUG: No API Key found in environment variables!{Style.RESET_ALL}")
-            raise ValueError("API Key not found.")
-        else:
-            masked_key = api_key[:4] + "..." + api_key[-4:]
-            print(f"{Fore.YELLOW}DEBUG: API Key loaded: {masked_key}{Style.RESET_ALL}")
-
+            raise ValueError("API Key not found. Please set GEMINI_API_KEY in .env file")
+        
         genai.configure(api_key=api_key)
         self.model = None
 
-        # Strategy 1: Try specific, fast models first
-        preferred_models = [
+        # 1. Back to the model we KNOW works for you
+        possible_models = [
+            'gemini-2.5-flash',      # It connected before, so let's use it
+            'gemini-2.0-flash-exp',
             'gemini-1.5-flash',
-            'gemini-1.5-flash-001',
-            'gemini-pro',
-            'gemini-1.0-pro'
+            'gemini-pro'
         ]
-
+        
         print(f"{Fore.CYAN}Configuring AI Model...{Style.RESET_ALL}")
-
-        # 1. Try Hardcoded names
-        for model_name in preferred_models:
+        
+        for model_name in possible_models:
             try:
-                print(f"Strategy 1: Testing {model_name}...", end=" ")
-                temp_model = genai.GenerativeModel(model_name)
+                print(f"Testing {model_name}...", end=" ")
+                temp_model = genai.GenerativeModel(
+                    model_name,
+                    # 2. Maximize tokens to delay the cutoff as much as possible
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7, 
+                        max_output_tokens=8000 
+                    )
+                )
                 temp_model.generate_content("Test")
                 self.model = temp_model
                 print(f"{Fore.GREEN}Success!{Style.RESET_ALL}")
@@ -46,73 +43,105 @@ class InterviewerAgent:
                 print(f"{Fore.RED}Failed.{Style.RESET_ALL}")
                 continue
         
-        # 2. Auto-Discovery (If Strategy 1 failed)
-        if self.model is None:
-            print(f"\n{Fore.YELLOW}Strategy 2: Auto-detecting available models for your key...{Style.RESET_ALL}")
-            try:
-                for m in genai.list_models():
-                    # We only want text generation models
-                    if 'generateContent' in m.supported_generation_methods:
-                        print(f"Found available model: {m.name}...", end=" ")
-                        try:
-                            temp_model = genai.GenerativeModel(m.name)
-                            temp_model.generate_content("Test")
-                            self.model = temp_model
-                            print(f"{Fore.GREEN}Connected!{Style.RESET_ALL}")
-                            break
-                        except Exception as e:
-                            print(f"{Fore.RED}Access Denied ({e}){Style.RESET_ALL}")
-            except Exception as e:
-                print(f"{Fore.RED}Could not list models: {e}{Style.RESET_ALL}")
+        if not self.model:
+            raise ValueError("CRITICAL: No working Gemini models found.")
 
-        # 3. Final Check
-        if self.model is None:
-            print(f"\n{Fore.RED}CRITICAL ERROR: Your API Key is valid, but has no access to ANY text generation models.{Style.RESET_ALL}")
-            print("Possible causes:")
-            print("1. You need to enable 'Generative Language API' in Google Cloud Console.")
-            print("2. Your billing project is frozen.")
-            print("3. You are in a region where Gemini is not yet supported.")
-            raise ValueError("No working models found.")
+        self.chat_session = None
 
-        self.history = []
+    def start_interview(self, job_description, resume_text, self_intro):
+        """
+        Initializes the interview.
+        """
+        clean_jd = job_description.strip()
+        # Truncate resume slightly to save context window space
+        clean_resume = resume_text[:10000].strip() 
+        clean_intro = self_intro.strip()
 
-    def start_interview(self, job_description):
-        initial_prompt = f"""
-        You are an expert technical interviewer. 
-        Here is the Job Description (JD) for the role: 
-        "{job_description}"
+        system_prompt = f"""
+        You are an expert Technical Interviewer.
         
-        Your goal is to interview a candidate. 
-        1. Ask relevant questions based on the JD.
-        2. Keep questions concise (1-2 sentences max).
-        3. Do not give feedback yet, just ask the first question.
+        CONTEXT:
+        1. JD: "{clean_jd}"
+        2. RESUME: "{clean_resume}"
+        3. INTRO: "{clean_intro}"
+
+        YOUR INTERVIEW PLAN (9 Questions Total):
+        - Questions 1-4: Ask strictly about the projects, experience, and gaps in the RESUME.
+        - Questions 5-9: Ask strictly about the technical skills required in the JOB DESCRIPTION.
+        
+        CURRENT STEP:
+        The candidate has just given their self-introduction.
+        Acknowledge it briefly, then ASK QUESTION #1 (Resume Focus).
         """
         
         self.chat_session = self.model.start_chat(history=[])
-        response = self.chat_session.send_message(initial_prompt)
-        return response.text
+        response = self.chat_session.send_message(system_prompt)
+        return self._safe_get_text(response)
 
-    def analyze_response_and_ask_next(self, candidate_response):
+    def analyze_response_and_ask_next(self, candidate_response, current_question_index):
+        """
+        Decides the topic based on the question index.
+        """
+        next_q_num = current_question_index + 2
+
+        instruction = ""
+        if next_q_num <= 4:
+            instruction = f"User just answered Q{next_q_num-1}. Now ask Question #{next_q_num} focusing on RESUME/PROJECTS."
+        elif next_q_num <= 9:
+            instruction = f"User just answered Q{next_q_num-1}. Now ask Question #{next_q_num} focusing on TECHNICAL JD SKILLS."
+        else:
+            instruction = "The interview is complete. Thank the candidate and say you will generate the report."
+
         prompt = f"""
-        The candidate answered: "{candidate_response}"
+        Candidate Answer: "{candidate_response}"
         
-        1. Briefly acknowledge the answer.
-        2. Ask the next relevant question based on the JD and their previous answer.
-        3. If the answer was too vague, ask a follow-up clarifying question.
+        SYSTEM INSTRUCTION: {instruction}
+        Keep the question concise (1-2 sentences).
         """
         
         response = self.chat_session.send_message(prompt)
-        return response.text
+        return self._safe_get_text(response)
 
     def generate_final_feedback(self):
-        prompt = """
-        The interview is over. Please provide a detailed evaluation report of the candidate.
-        Include:
-        1. Strengths shown.
-        2. Weaknesses/Areas for improvement.
-        3. Rating out of 10 for the specific role in the JD.
-        4. Final Hiring Recommendation (Yes/No).
         """
+        Generates the detailed final report with Yes/No verdict.
+        """
+        prompt = """
+        SYSTEM INSTRUCTION: STOP roleplaying. 
+        TASK: Generate a rigorous Hiring Evaluation Report based on the entire session.
         
+        FORMAT REQUIRED:
+        
+        1. 📄 RESUME & INTRO ANALYSIS
+           - Did the intro cover key highlights?
+           - Are the resume projects legitimate based on their answers?
+           
+        2. 🧠 TECHNICAL KNOWLEDGE EVALUATION
+           - Python/Coding Skills: [Weak/Average/Strong]
+           - Theoretical Knowledge: [Weak/Average/Strong]
+           (Cite specific examples from the interview)
+           
+        3. 🏆 FINAL VERDICT
+           - Hiring Recommendation: [YES / NO]
+           
+        4. ⭐ OVERALL RATING
+           - [ X / 10 ]
+        """
         response = self.chat_session.send_message(prompt)
-        return response.text
+        return self._safe_get_text(response)
+
+    def _safe_get_text(self, response):
+        """
+        CRASH PROTECTION: This is the critical fix.
+        Even if the model stops early (finish_reason=2), this extracts whatever text exists.
+        """
+        try:
+            return response.text
+        except Exception:
+            # If standard access fails, try to dig into the candidates list manually
+            try:
+                if response.candidates and response.candidates[0].content.parts:
+                    return response.candidates[0].content.parts[0].text
+            except:
+                pass
+            return "Error: AI response was blocked or empty. (But the app didn't crash!)"
